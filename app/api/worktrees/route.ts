@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { existsSync } from "fs";
-import { addWorktree, listWorktrees, removeWorktree, resolveProject } from "@/lib/worktree";
+import { addWorktree, findCurrentWorktreePath, listWorktrees, removeWorktree, resolveProject, WorktreeBranchInUseError, worktreeRemovalRequiresForce } from "@/lib/worktree";
 import { allowFileRoot, getAllowedFileRoots, isExistingFilePathAllowed, isFilePathAllowed } from "@/lib/file-access";
+import { projectIdentityKey } from "@/lib/project-identity";
 
 /** Same gate as /api/files: only session cwds / project roots / explicitly
  *  allowed dirs may be inspected or mutated through this endpoint. */
@@ -13,7 +14,7 @@ async function checkCwdAllowed(cwd: string): Promise<NextResponse | null> {
   return null;
 }
 
-// GET /api/worktrees?cwd=  →  { projectRoot, isGit, isTopLevel, worktrees }
+// GET /api/worktrees?cwd=  →  { projectRoot, projectKey, isGit, isTopLevel, currentWorktreePath, worktrees }
 export async function GET(req: Request) {
   try {
     const cwd = new URL(req.url).searchParams.get("cwd");
@@ -25,11 +26,13 @@ export async function GET(req: Request) {
 
     const project = await resolveProject(cwd);
     let worktrees: Awaited<ReturnType<typeof listWorktrees>> = [];
+    let currentWorktreePath: string | null = null;
     let isGit = true;
     try {
       // For a removed-worktree cwd (session of a deleted worktree), fall back
       // to the inferred project root so the switcher still shows the project.
       worktrees = await listWorktrees(existsSync(cwd) ? cwd : project.projectRoot);
+      currentWorktreePath = findCurrentWorktreePath(worktrees, cwd);
     } catch {
       isGit = false;
     }
@@ -39,8 +42,10 @@ export async function GET(req: Request) {
     for (const w of worktrees) allowFileRoot(w.path);
     return NextResponse.json({
       projectRoot: project.projectRoot,
+      projectKey: projectIdentityKey(project.projectRoot),
       isGit,
       isTopLevel: project.isTopLevel,
+      currentWorktreePath,
       worktrees,
     });
   } catch (error) {
@@ -49,6 +54,8 @@ export async function GET(req: Request) {
 }
 
 // POST /api/worktrees  body: { cwd, branch }  →  { path, branch }
+//   409 { code: "branch_in_use", branch, worktreePath } when another worktree has the branch,
+//   code "branch_worktree_missing" when that worktree's folder is gone (git worktree prune clears it)
 export async function POST(req: Request) {
   try {
     const body = await req.json() as { cwd?: string; branch?: string };
@@ -68,6 +75,17 @@ export async function POST(req: Request) {
     return NextResponse.json(result);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (error instanceof WorktreeBranchInUseError) {
+      return NextResponse.json(
+        {
+          error: message,
+          code: error.missing ? "branch_worktree_missing" : "branch_in_use",
+          branch: error.branch,
+          worktreePath: error.worktreePath,
+        },
+        { status: 409 },
+      );
+    }
     return NextResponse.json({ error: message }, { status: 400 });
   }
 }
@@ -89,9 +107,9 @@ export async function DELETE(req: Request) {
     return NextResponse.json({ success: true });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    // git refuses to remove dirty worktrees without --force; surface that so
-    // the UI can offer a force-remove confirmation.
-    const dirty = /contains modified or untracked files|is dirty/i.test(message);
+    // Git refuses some worktree removals without --force, including worktrees
+    // with submodule state. Surface that so the UI can offer confirmation.
+    const dirty = worktreeRemovalRequiresForce(message);
     return NextResponse.json({ error: message, dirty }, { status: dirty ? 409 : 400 });
   }
 }

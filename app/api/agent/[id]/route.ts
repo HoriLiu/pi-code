@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { resolveSessionPath } from "@/lib/session-reader";
-import { startRpcSession, getRpcSession } from "@/lib/rpc-manager";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { startRpcSession, getRpcSession, setRpcSessionTools } from "@/lib/rpc-manager";
+import { cwdMissingBody, missingCwdFromBody } from "@/lib/missing-cwd";
 
 // POST /api/agent/[id] - Send a command to an existing session
 export async function POST(
@@ -9,36 +9,73 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+  let commandType: string | undefined;
+  let promptAccepted = false;
 
   try {
     const body = await req.json() as { type: string; [key: string]: unknown };
+    commandType = typeof body.type === "string" ? body.type : undefined;
+    const requestedToolNames = body.toolNames;
+    if (
+      requestedToolNames !== undefined
+      && (!Array.isArray(requestedToolNames) || requestedToolNames.some((name) => typeof name !== "string"))
+    ) {
+      throw new Error("toolNames must be an array of strings");
+    }
+    const toolNames = requestedToolNames as string[] | undefined;
 
     // Fast path: already-running session
     const existing = getRpcSession(id);
+    if (body.type === "set_tools") {
+      const filePath = existing?.sessionFile || await resolveSessionPath(id) || undefined;
+      if (!existing?.isAlive() && !filePath) {
+        return NextResponse.json({ error: "Session not found" }, { status: 404 });
+      }
+      const changed = await setRpcSessionTools(id, filePath, toolNames);
+      return NextResponse.json({
+        success: true,
+        data: { sessionId: changed.sessionId, recreated: changed.recreated },
+      });
+    }
     if (existing?.isAlive()) {
       const result = await existing.send(body);
+      promptAccepted = body.type === "prompt";
       return NextResponse.json({ success: true, data: result });
     }
 
     const filePath = await resolveSessionPath(id);
     if (!filePath) {
-      return NextResponse.json({ error: "Session not found" }, { status: 404 });
+      return NextResponse.json({
+        error: "Session not found",
+        ...(body.type === "prompt"
+          ? { code: "prompt_rejected", accepted: false }
+          : {}),
+      }, { status: 404 });
     }
 
-    const cwd = SessionManager.open(filePath).getHeader()?.cwd ?? process.cwd();
-
-    const { session } = await startRpcSession(id, filePath, cwd);
+    const { session } = await startRpcSession(id, filePath, undefined, {
+      ...(toolNames !== undefined ? { toolNames } : {}),
+    });
     const result = await session.send(body);
+    promptAccepted = body.type === "prompt";
 
     return NextResponse.json({ success: true, data: result });
   } catch (error) {
-    return NextResponse.json({ error: String(error) }, { status: 500 });
+    // Read by its fields: the wrapper that threw may come from another route's bundle.
+    const missingCwd = missingCwdFromBody(error);
+    return NextResponse.json({
+      error: error instanceof Error ? error.message : String(error),
+      ...(missingCwd ? cwdMissingBody(missingCwd) : {}),
+      ...(commandType === "prompt" && !promptAccepted
+        ? { code: "prompt_rejected", accepted: false }
+        : {}),
+    }, { status: 500 });
   }
 }
 
 // GET /api/agent/[id] - Get current agent state
 export async function GET(
-  _req: Request,
+  req: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
@@ -49,7 +86,9 @@ export async function GET(
       return NextResponse.json({ running: false });
     }
 
-    const state = await session.send({ type: "get_state" });
+    const state = await session.send({ type: "get_state" }) as Record<string, unknown>;
+    // Status reads leave out the system prompt, most of the reply (agentStatusUrl()).
+    if (new URL(req.url).searchParams.get("systemPrompt") === "0") delete state.systemPrompt;
     return NextResponse.json({ running: true, state });
   } catch (error) {
     return NextResponse.json({ error: String(error) }, { status: 500 });

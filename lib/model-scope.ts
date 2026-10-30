@@ -6,6 +6,16 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { Api, Model } from "@earendil-works/pi-ai";
 
+const THINKING_LEVEL_SUFFIXES = new Set<ThinkingLevel>([
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
+
 /**
  * Model scoping shared by the UI selector and AgentSession startup.
  *
@@ -14,7 +24,10 @@ import type { Api, Model } from "@earendil-works/pi-ai";
  * fuzzy matching for non-glob patterns, plus an optional `:thinkingLevel` suffix
  * (`anthropic/*:high`). Exact string comparison silently drops every model
  * behind a pattern like `my-gateway/*` (#307), so delegate to pi's own resolver
- * instead of reimplementing the matching rules here.
+ * instead of reimplementing the matching rules here. That includes a bare id
+ * several providers offer (`claude-sonnet-5` on anthropic and a gateway): since
+ * pi 1.3 the resolver scopes every one of them and warns that the entry is
+ * ambiguous, so pi-web shows that warning instead of refusing the entry.
  */
 
 export interface ModelScopeResult {
@@ -47,6 +60,17 @@ function matchesModel(
   return model.provider === ref.provider && model.id === ref.modelId;
 }
 
+function hasGlob(pattern: string): boolean {
+  return pattern.includes("*") || pattern.includes("?") || pattern.includes("[");
+}
+
+function isSuppressibleUnmatchedGlob(pattern: string): boolean {
+  if (!hasGlob(pattern)) return false;
+  const colonIndex = pattern.lastIndexOf(":");
+  return colonIndex < 0
+    || THINKING_LEVEL_SUFFIXES.has(pattern.slice(colonIndex + 1) as ThinkingLevel);
+}
+
 /**
  * Resolve the visible model list for `patterns`.
  *
@@ -68,11 +92,26 @@ export async function resolveVisibleModels(
     };
   }
 
-  const { scopedModels, diagnostics } = await resolveModelScopeWithDiagnostics(cleaned, modelRuntime);
-  const warnings = diagnostics.map((diagnostic) => diagnostic.message);
+  const available = await modelRuntime.getAvailable();
+  const snapshotRuntime = {
+    getAvailable: async () => available,
+  } as ModelRuntime;
+  const { scopedModels, diagnostics } = await resolveModelScopeWithDiagnostics(cleaned, snapshotRuntime);
+  // A leftover valid glob after a model was removed is not a chat-level problem
+  // when other enabledModels entries still matched. Keep exact and malformed
+  // pattern warnings, and keep all no-match warnings for a total miss, where
+  // the UI falls back to every available model and the user needs to know the
+  // scope did not apply.
+  const warnings = diagnostics
+    .filter((diagnostic) => (
+      diagnostic.code !== "no-match"
+      || scopedModels.length === 0
+      || !isSuppressibleUnmatchedGlob(diagnostic.pattern)
+    ))
+    .map((diagnostic) => diagnostic.message);
   if (scopedModels.length === 0) {
     return {
-      visible: await modelRuntime.getAvailable(),
+      visible: available,
       scopedModels: [],
       thinkingLevelPins: {},
       warnings,
@@ -94,6 +133,20 @@ export async function resolveVisibleModels(
     thinkingLevelPins,
     warnings,
   };
+}
+
+/**
+ * The model selector's order, as in pi's `/model` (the TUI's
+ * ModelSelectorComponent): a scope keeps its `enabledModels` order; the full
+ * list is sorted by provider id only, so each provider keeps its registry
+ * order, which for a models.json provider is the file's order (#783). The TUI
+ * also lifts the current and default models to the top; the web selector marks
+ * them in place instead.
+ */
+export function orderSelectorModels(scope: ModelScopeResult): Model<Api>[] {
+  if (scope.scopedModels.length > 0) return [...scope.visible];
+  // Array.prototype.sort is stable: models of one provider keep their order.
+  return [...scope.visible].sort((a, b) => a.provider.localeCompare(b.provider));
 }
 
 /**
